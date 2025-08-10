@@ -1,0 +1,28 @@
+telegram:
+  bot_token: "8343755970:AAGLqz79F1cRyXS2anb76B0BGCq5wbOPBFw"
+  chat_id: "5521374652"
+
+searches:
+  # LOCALES
+  - name: "Locales Palermo"
+    url: "https://www.zonaprop.com.ar/locales-comerciales-venta-palermo-orden-publicado-descendente.html"
+  - name: "Locales Belgrano"
+    url: "https://www.zonaprop.com.ar/locales-comerciales-venta-belgrano-orden-publicado-descendente.html"
+  - name: "Locales Núñez"
+    url: "https://www.zonaprop.com.ar/locales-comerciales-venta-nunez-orden-publicado-descendente.html"
+  - name: "Locales Recoleta"
+    url: "https://www.zonaprop.com.ar/locales-comerciales-venta-recoleta-orden-publicado-descendente.html"
+  - name: "Locales Chacarita"
+    url: "https://www.zonaprop.com.ar/locales-comerciales-venta-chacarita-orden-publicado-descendente.html"
+
+  # TERRENOS
+  - name: "Terrenos Palermo"
+    url: "https://www.zonaprop.com.ar/terrenos-venta-palermo-orden-publicado-descendente.html"
+  - name: "Terrenos Belgrano"
+    url: "https://www.zonaprop.com.ar/terrenos-venta-belgrano-orden-publicado-descendente.html"
+  - name: "Terrenos Núñez"
+    url: "https://www.zonaprop.com.ar/terrenos-venta-nunez-orden-publicado-descendente.html"
+  - name: "Terrenos Recoleta"
+    url: "https://www.zonaprop.com.ar/terrenos-venta-recoleta-orden-publicado-descendente.html"
+  - name: "Terrenos Chacarita"
+    url: "https://www.zonaprop.com.ar/terrenos-venta-chacarita-orden-publicado-descendente.html"
