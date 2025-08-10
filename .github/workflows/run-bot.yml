@@ -1,0 +1,51 @@
+name: Zonaprop Bot (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # cada hora en punto (UTC)
+  workflow_dispatch:       # permite dispararlo a mano
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright (Chromium + deps)
+        run: |
+          python -m playwright install --with-deps chromium
+
+      # Restaura historial de vistos (.data/seen.json)
+      - name: Restore seen.json cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .data/seen.json
+          key: seen-${{ github.run_id }}
+          restore-keys: |
+            seen-
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python main.py
+
+      # Guarda el historial actualizado
+      - name: Save seen.json cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .data/seen.json
+          key: seen-${{ github.run_id }}
