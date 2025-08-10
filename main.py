@@ -7,7 +7,7 @@ from playwright.async_api import async_playwright
 
 # ================== CARGA DE CONFIG ==================
 DEF_CFG = {
-    "max_age_hours": 24,
+    "max_age_hours": 24,           # Aún se usa para fechas ISO reales (JSON-LD/meta); visible-text fuerza "solo hoy"
     "top_n_per_search": 10,
     "per_link_delay_sec": 1.0,
     "searches": [],
@@ -70,12 +70,10 @@ AD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Heurísticas de fecha en texto
-RE_MIN  = re.compile(r"hace\s+(\d+)\s*minutos?", re.I)
-RE_HRS  = re.compile(r"hace\s+(\d+)\s*horas?", re.I)
-RE_DIAS = re.compile(r"hace\s+(\d+)\s*d[ií]as?", re.I)
-RE_HOY  = re.compile(r"\bhoy\b", re.I)
-RE_AYER = re.compile(r"\bayer\b", re.I)
+# Heurísticas SOLO HOY en texto visible
+RE_MIN  = re.compile(r"hace\s+(\d+)\s*min(uto|utos)?", re.I)
+RE_HRS  = re.compile(r"hace\s+(\d+)\s*hora(s)?", re.I)
+RE_HOY  = re.compile(r"\bpublicado\s+hoy\b|\bhoy\b", re.I)  # cubre "Publicado hoy"
 
 def parse_iso_to_utc_hours_ago(iso_str: str) -> float | None:
     try:
@@ -91,19 +89,24 @@ def parse_iso_to_utc_hours_ago(iso_str: str) -> float | None:
     except Exception:
         return None
 
-def text_hours_ago(txt: str) -> float | None:
+def text_hours_today_only(txt: str) -> float | None:
+    """
+    Devuelve horas transcurridas SOLO si es de hoy:
+      - "Publicado hoy" -> 0.0
+      - "hace X minutos" -> X/60
+      - "hace X horas"   -> X
+    Descarta todo lo demás: "ayer", "hace X días", fechas completas, etc.
+    """
     t = (txt or "").lower()
     if RE_HOY.search(t):
         return 0.0
     m = RE_MIN.search(t)
-    if m: return int(m.group(1)) / 60.0
+    if m: 
+        return int(m.group(1)) / 60.0
     m = RE_HRS.search(t)
-    if m: return float(m.group(1))
-    m = RE_DIAS.search(t)
-    if m: return int(m.group(1)) * 24.0
-    if RE_AYER.search(t):
-        return 24.0
-    return None
+    if m: 
+        return float(m.group(1))
+    return None  # nada de ayer/días
 
 async def scrape_list(list_page, url: str) -> list[str]:
     await list_page.goto(url, timeout=120_000, wait_until="domcontentloaded")
@@ -143,10 +146,11 @@ async def scrape_list(list_page, url: str) -> list[str]:
 async def get_age_hours(detail_page, url: str) -> float | None:
     """
     Devuelve cuántas horas pasaron desde la publicación real del aviso.
-    Intenta en orden:
+    Orden:
       1) JSON-LD: datePublished / uploadDate / dateModified
       2) Meta: article:published_time / itemprop=datePublished
-      3) Texto visible: 'Publicado hoy / hace X horas/minutos/días / ayer'
+      3) Texto visible SOLO HOY: 'Publicado hoy' / 'hace X horas/minutos'
+         (descarta 'ayer' o 'hace X días' devolviendo None)
     """
     try:
         await detail_page.goto(url, timeout=120_000, wait_until="domcontentloaded")
@@ -185,12 +189,12 @@ async def get_age_hours(detail_page, url: str) -> float | None:
             if hrs is not None:
                 return hrs
 
-        # 3) Texto visible heurístico
+        # 3) Texto visible SOLO HOY
         whole = await detail_page.eval_on_selector(
             "body", "el => (el.textContent || '').replace(/\\s+/g,' ').trim()"
         )
-        hrs = text_hours_ago(whole or "")
-        return hrs
+        hrs = text_hours_today_only(whole or "")
+        return hrs  # None si no es de hoy
     except Exception as e:
         print(f"[age] {e}")
         return None
@@ -213,7 +217,8 @@ async def run(force: bool = False, warmup: bool = False):
         list_page   = await ctx.new_page()
         detail_page = await ctx.new_page()
 
-        for name, url in [(s["name"], s["url"]) for s in SEARCHES]:
+        for s in SEARCHES:
+            name, url = s["name"], s["url"]
             print(f"Buscando {name} ...")
             try:
                 links = await scrape_list(list_page, url)
@@ -231,7 +236,7 @@ async def run(force: bool = False, warmup: bool = False):
             # candidatos (si no es force, excluimos ya enviados)
             candidates = links if force else [u for u in links if u not in seen]
 
-            # chequeamos hasta cubrir el tope (revisamos algunos más por si varios quedan afuera por antigüedad)
+            # chequeamos hasta cubrir el tope (miramos algunos más por si varios quedan afuera)
             to_check = candidates[: max(TOP_N_PER_SEARCH * 3, TOP_N_PER_SEARCH + 5)]
             enviados = 0
             header_sent = False
@@ -239,7 +244,7 @@ async def run(force: bool = False, warmup: bool = False):
             for u in to_check:
                 age = await get_age_hours(detail_page, u)
                 if age is None:
-                    # si no pudimos inferir, no lo enviamos
+                    # No es de hoy o no pudimos inferir -> descartar
                     continue
                 if age <= MAX_AGE_HOURS:
                     if not header_sent:
@@ -253,7 +258,7 @@ async def run(force: bool = False, warmup: bool = False):
                         break
 
             if not force:
-                # métrica: cuántos nuevos detectamos (antes del recorte)
+                # métrica: cuántos candidatos NUEVOS vimos esta vez (antes de filtros)
                 total_new_detected += len([u for u in candidates if u not in seen])
 
         await browser.close()
