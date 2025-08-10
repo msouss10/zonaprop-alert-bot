@@ -1,13 +1,24 @@
-telegram:
-  bot_token: "8343755970:AAGLqz79F1cRyXS2anb76B0BGCq5wbOPBFw"
-  chat_id: "5521374652"
+# Configuración general
+# BOT_TOKEN y CHAT_ID se toman de GitHub Secrets (no ponerlos acá).
 
+# Solo avisos publicados en las últimas N horas (24 = hoy)
+max_age_hours: 24
+
+# Límite de avisos nuevos por búsqueda en cada corrida
+top_n_per_search: 10
+
+# Pausa entre mensajes para que se generen vistas previas correctas en Telegram (en segundos)
+per_link_delay_sec: 1.0
+
+# Lista de búsquedas en Zonaprop
 searches:
-  # LOCALES
+  # ——— LOCALES ———
   - name: "Locales Palermo"
     url: "https://www.zonaprop.com.ar/locales-comerciales-venta-palermo-orden-publicado-descendente.html"
   - name: "Locales Belgrano"
     url: "https://www.zonaprop.com.ar/locales-comerciales-venta-belgrano-orden-publicado-descendente.html"
+  - name: "Locales Barrio Norte"
+    url: "https://www.zonaprop.com.ar/locales-comerciales-venta-barrio-norte-orden-publicado-descendente.html"
   - name: "Locales Núñez"
     url: "https://www.zonaprop.com.ar/locales-comerciales-venta-nunez-orden-publicado-descendente.html"
   - name: "Locales Recoleta"
@@ -15,11 +26,13 @@ searches:
   - name: "Locales Chacarita"
     url: "https://www.zonaprop.com.ar/locales-comerciales-venta-chacarita-orden-publicado-descendente.html"
 
-  # TERRENOS
+  # ——— TERRENOS ———
   - name: "Terrenos Palermo"
     url: "https://www.zonaprop.com.ar/terrenos-venta-palermo-orden-publicado-descendente.html"
   - name: "Terrenos Belgrano"
     url: "https://www.zonaprop.com.ar/terrenos-venta-belgrano-orden-publicado-descendente.html"
+  - name: "Terrenos Barrio Norte"
+    url: "https://www.zonaprop.com.ar/terrenos-venta-barrio-norte-orden-publicado-descendente.html"
   - name: "Terrenos Núñez"
     url: "https://www.zonaprop.com.ar/terrenos-venta-nunez-orden-publicado-descendente.html"
   - name: "Terrenos Recoleta"
