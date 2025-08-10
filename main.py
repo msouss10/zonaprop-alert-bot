@@ -1,71 +1,39 @@
 #!/usr/bin/env python3
-import asyncio, os, json, re, sys, time, math
+import asyncio, os, json, re, sys, time
 from pathlib import Path
 from datetime import datetime, timezone
-import requests
+import requests, yaml
 from playwright.async_api import async_playwright
 
-# ============ Credenciales ============
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "TU_TOKEN_SI_CORRES_LOCAL"
-CHAT_ID   = os.getenv("CHAT_ID")   or "TU_CHAT_ID_SI_CORRES_LOCAL"
+# ================== CARGA DE CONFIG ==================
+DEF_CFG = {
+    "max_age_hours": 24,
+    "top_n_per_search": 10,
+    "per_link_delay_sec": 1.0,
+    "searches": [],
+}
+def load_cfg():
+    cfg = DEF_CFG.copy()
+    if Path("config.yaml").exists():
+        with open("config.yaml","r",encoding="utf-8") as f:
+            file_cfg = yaml.safe_load(f) or {}
+        cfg.update({k:v for k,v in file_cfg.items() if k in DEF_CFG or k=="telegram"})
+    return cfg
 
-# ============ Config ============
-# Solo enviar si el aviso fue publicado dentro de las últimas N horas
-MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "24"))
+CFG = load_cfg()
 
-# Máximo a enviar por búsqueda en cada corrida (para no saturar)
-TOP_N_PER_SEARCH   = int(os.getenv("TOP_N_PER_SEARCH", "10"))
-PER_LINK_DELAY_SEC = float(os.getenv("PER_LINK_DELAY_SEC", "1.0"))
+# BOT_TOKEN/CHAT_ID: en GitHub se leen de Secrets; localmente podés ponerlos en config.yaml (telegram.*)
+BOT_TOKEN = os.getenv("BOT_TOKEN") or (CFG.get("telegram",{}) or {}).get("bot_token") or ""
+CHAT_ID   = os.getenv("CHAT_ID")   or str((CFG.get("telegram",{}) or {}).get("chat_id") or "")
 
-# Listado de búsquedas (solo barrio + recientes)
-SEARCHES = [
-    # LOCALES
-    ("Locales Palermo",  "https://www.zonaprop.com.ar/locales-comerciales-venta-palermo-orden-publicado-descendente.html"),
-    ("Locales Belgrano", "https://www.zonaprop.com.ar/locales-comerciales-venta-belgrano-orden-publicado-descendente.html"),
-    ("Locales Núñez",    "https://www.zonaprop.com.ar/locales-comerciales-venta-nunez-orden-publicado-descendente.html"),
-    ("Locales Recoleta", "https://www.zonaprop.com.ar/locales-comerciales-venta-recoleta-orden-publicado-descendente.html"),
-    ("Locales Chacarita","https://www.zonaprop.com.ar/locales-comerciales-venta-chacarita-orden-publicado-descendente.html"),
-    # TERRENOS
-    ("Terrenos Palermo",  "https://www.zonaprop.com.ar/terrenos-venta-palermo-orden-publicado-descendente.html"),
-    ("Terrenos Belgrano", "https://www.zonaprop.com.ar/terrenos-venta-belgrano-orden-publicado-descendente.html"),
-    ("Terrenos Núñez",    "https://www.zonaprop.com.ar/terrenos-venta-nunez-orden-publicado-descendente.html"),
-    ("Terrenos Recoleta", "https://www.zonaprop.com.ar/terrenos-venta-recoleta-orden-publicado-descendente.html"),
-    ("Terrenos Chacarita","https://www.zonaprop.com.ar/terrenos-venta-chacarita-orden-publicado-descendente.html"),
-]
+MAX_AGE_HOURS       = int(os.getenv("MAX_AGE_HOURS", str(CFG["max_age_hours"])))
+TOP_N_PER_SEARCH    = int(os.getenv("TOP_N_PER_SEARCH", str(CFG["top_n_per_search"])))
+PER_LINK_DELAY_SEC  = float(os.getenv("PER_LINK_DELAY_SEC", str(CFG["per_link_delay_sec"])))
+SEARCHES            = CFG["searches"]
 
-# Estado
+# ================== ESTADO ==================
 DATA_DIR  = Path(".data"); DATA_DIR.mkdir(exist_ok=True, parents=True)
 SEEN_FILE = DATA_DIR / "seen.json"
-
-# Patrones
-AD_PATTERN = re.compile(
-    r"^(?:https?://www\.zonaprop\.com\.ar)?/propiedades/(?:clasificado/)?[A-Za-z0-9\-]+-\d+\.html$",
-    re.IGNORECASE,
-)
-RE_MIN  = re.compile(r"hace\s+(\d+)\s*minutos?", re.I)
-RE_HRS  = re.compile(r"hace\s+(\d+)\s*horas?", re.I)
-RE_DIAS = re.compile(r"hace\s+(\d+)\s*d[ií]as?", re.I)
-RE_HOY  = re.compile(r"\bhoy\b", re.I)
-RE_AYER = re.compile(r"\bayer\b", re.I)
-
-# ------------ Util Telegram ------------
-def send_text(text: str, preview: bool = False):
-    api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": (not preview)
-    }
-    try:
-        r = requests.post(api, data=payload, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[Telegram] {e}")
-
-def send_link(url: str):
-    # Solo el link: Telegram arma título+descripción+foto
-    send_text(url, preview=True)
-# ---------------------------------------
 
 def load_seen() -> set:
     if SEEN_FILE.exists():
@@ -78,6 +46,37 @@ def load_seen() -> set:
 def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2))
 
+# ================== TELEGRAM ==================
+def send_text(text: str, preview: bool = False):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[Telegram] Falta BOT_TOKEN o CHAT_ID")
+        return
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": (not preview)}
+    try:
+        r = requests.post(api, data=payload, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[Telegram] {e}")
+
+def send_link(url: str):
+    # Enviar solo el link para que Telegram genere título+descripción+foto
+    send_text(url, preview=True)
+
+# ================== EXTRACCIÓN ==================
+# URL de aviso válida
+AD_PATTERN = re.compile(
+    r"^(?:https?://www\.zonaprop\.com\.ar)?/propiedades/(?:clasificado/)?[A-Za-z0-9\-]+-\d+\.html$",
+    re.IGNORECASE,
+)
+
+# Heurísticas de fecha en texto
+RE_MIN  = re.compile(r"hace\s+(\d+)\s*minutos?", re.I)
+RE_HRS  = re.compile(r"hace\s+(\d+)\s*horas?", re.I)
+RE_DIAS = re.compile(r"hace\s+(\d+)\s*d[ií]as?", re.I)
+RE_HOY  = re.compile(r"\bhoy\b", re.I)
+RE_AYER = re.compile(r"\bayer\b", re.I)
+
 def parse_iso_to_utc_hours_ago(iso_str: str) -> float | None:
     try:
         s = iso_str.strip()
@@ -88,41 +87,36 @@ def parse_iso_to_utc_hours_ago(iso_str: str) -> float | None:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
-        delta = now - dt.astimezone(timezone.utc)
-        return delta.total_seconds() / 3600.0
+        return (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
     except Exception:
         return None
 
 def text_hours_ago(txt: str) -> float | None:
     t = (txt or "").lower()
-
     if RE_HOY.search(t):
         return 0.0
     m = RE_MIN.search(t)
-    if m:
-        return int(m.group(1)) / 60.0
+    if m: return int(m.group(1)) / 60.0
     m = RE_HRS.search(t)
-    if m:
-        return float(m.group(1))
+    if m: return float(m.group(1))
     m = RE_DIAS.search(t)
-    if m:
-        return int(m.group(1)) * 24.0
+    if m: return int(m.group(1)) * 24.0
     if RE_AYER.search(t):
-        return 24.0  # aprox
+        return 24.0
     return None
 
-async def scrape_list(page, url: str) -> list[str]:
-    await page.goto(url, timeout=120_000, wait_until="domcontentloaded")
+async def scrape_list(list_page, url: str) -> list[str]:
+    await list_page.goto(url, timeout=120_000, wait_until="domcontentloaded")
     try:
-        await page.wait_for_load_state("networkidle", timeout=60_000)
+        await list_page.wait_for_load_state("networkidle", timeout=60_000)
     except:
         pass
-    # Scroll para cargar más
+    # scroll para cargar resultados
     for _ in range(12):
-        await page.mouse.wheel(0, 6000)
-        await page.wait_for_timeout(800)
+        await list_page.mouse.wheel(0, 6000)
+        await list_page.wait_for_timeout(800)
 
-    hrefs = await page.eval_on_selector_all(
+    hrefs = await list_page.eval_on_selector_all(
         "a[href*='/propiedades/']",
         "els => els.map(e => e.getAttribute('href') || '')",
     )
@@ -148,11 +142,11 @@ async def scrape_list(page, url: str) -> list[str]:
 
 async def get_age_hours(detail_page, url: str) -> float | None:
     """
-    Abre el aviso y trata de inferir la edad:
+    Devuelve cuántas horas pasaron desde la publicación real del aviso.
+    Intenta en orden:
       1) JSON-LD: datePublished / uploadDate / dateModified
-      2) <meta property="article:published_time">
+      2) Meta: article:published_time / itemprop=datePublished
       3) Texto visible: 'Publicado hoy / hace X horas/minutos/días / ayer'
-    Devuelve horas (float) o None si no pudo inferir.
     """
     try:
         await detail_page.goto(url, timeout=120_000, wait_until="domcontentloaded")
@@ -170,7 +164,6 @@ async def get_age_hours(detail_page, url: str) -> float | None:
             try:
                 import json as _json
                 data = _json.loads(raw)
-                # puede ser objeto o lista
                 candidates = data if isinstance(data, list) else [data]
                 for d in candidates:
                     for key in ("datePublished", "uploadDate", "dateModified"):
@@ -182,7 +175,7 @@ async def get_age_hours(detail_page, url: str) -> float | None:
             except Exception:
                 pass
 
-        # 2) OpenGraph/Meta
+        # 2) Meta
         meta_time = await detail_page.eval_on_selector(
             "meta[property='article:published_time'], meta[itemprop='datePublished']",
             "el => el ? el.getAttribute('content') : null"
@@ -202,7 +195,12 @@ async def get_age_hours(detail_page, url: str) -> float | None:
         print(f"[age] {e}")
         return None
 
+# ================== RUN ==================
 async def run(force: bool = False, warmup: bool = False):
+    if not SEARCHES:
+        print("No hay 'searches' en config.yaml")
+        return
+
     seen = load_seen()
     total_new_detected = 0
 
@@ -215,7 +213,7 @@ async def run(force: bool = False, warmup: bool = False):
         list_page   = await ctx.new_page()
         detail_page = await ctx.new_page()
 
-        for name, url in SEARCHES:
+        for name, url in [(s["name"], s["url"]) for s in SEARCHES]:
             print(f"Buscando {name} ...")
             try:
                 links = await scrape_list(list_page, url)
@@ -223,33 +221,29 @@ async def run(force: bool = False, warmup: bool = False):
                 print(f"[WARN] {name}: {e}")
                 continue
 
-            # Si solo queremos llenar historial inicial
             if warmup:
                 nuevos = [u for u in links if u not in seen]
                 seen.update(links)
                 total_new_detected += len(nuevos)
-                print(f"  (warmup) vistos ahora: {len(links)} | nuevos marcados: {len(nuevos)}")
+                print(f"  (warmup) vistos: {len(links)} | nuevos marcados: {len(nuevos)}")
                 continue
 
-            # Encabezado (solo si hay algo para enviar tras filtrar)
-            enviados = 0
-
-            # Si force: ignoramos historial pero respetamos filtro de antigüedad
+            # candidatos (si no es force, excluimos ya enviados)
             candidates = links if force else [u for u in links if u not in seen]
 
-            # Revisamos detalles hasta completar TOP_N_PER_SEARCH
+            # chequeamos hasta cubrir el tope (revisamos algunos más por si varios quedan afuera por antigüedad)
             to_check = candidates[: max(TOP_N_PER_SEARCH * 3, TOP_N_PER_SEARCH + 5)]
+            enviados = 0
             header_sent = False
 
             for u in to_check:
-                # Chequear antigüedad real
                 age = await get_age_hours(detail_page, u)
                 if age is None:
-                    # si no pudimos inferir, por defecto NO enviar
+                    # si no pudimos inferir, no lo enviamos
                     continue
                 if age <= MAX_AGE_HOURS:
                     if not header_sent:
-                        send_text(f"{name}:")
+                        send_text(f"{name}:")  # encabezado
                         header_sent = True
                     send_link(u)
                     enviados += 1
@@ -259,6 +253,7 @@ async def run(force: bool = False, warmup: bool = False):
                         break
 
             if not force:
+                # métrica: cuántos nuevos detectamos (antes del recorte)
                 total_new_detected += len([u for u in candidates if u not in seen])
 
         await browser.close()
@@ -267,7 +262,7 @@ async def run(force: bool = False, warmup: bool = False):
     if warmup:
         print("Warm-up listo. Historial guardado en .data/seen.json")
     else:
-        print(f"Listo. Nuevos detectados (antes del recorte por tope y filtro): {total_new_detected}")
+        print(f"Listo. Nuevos detectados (previo a filtro/tope): {total_new_detected}")
 
 if __name__ == "__main__":
     FORCE  = "--force"  in sys.argv
