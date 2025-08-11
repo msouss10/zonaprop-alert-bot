@@ -5,7 +5,7 @@ import asyncio, os, json, time
 from pathlib import Path
 from typing import List, Dict, Any
 import requests
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ================== CONFIG ==================
 DEF_CFG = {
@@ -52,7 +52,6 @@ def save_cache(cache: Dict[str, float]) -> None:
     CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def normalize_search(entry: Any) -> Dict[str, str]:
-    """Acepta string o dict {name, url} y devuelve {'name': str, 'url': str}."""
     if isinstance(entry, dict):
         return {"name": str(entry.get("name", "")).strip(), "url": str(entry.get("url", "")).strip()}
     return {"name": "", "url": str(entry).strip()}
@@ -60,36 +59,86 @@ def normalize_search(entry: Any) -> Dict[str, str]:
 # ================== SCRAPER ==================
 SEARCH_A_SELECTOR = 'a[href*="/propiedades/"]'
 
+async def dismiss_popups(page):
+    # Variantes comunes de cookies/consent en Zonaprop/Navent
+    selectors = [
+        'button:has-text("Aceptar")',
+        'button:has-text("Acepto")',
+        'button:has-text("Entendido")',
+        'div[id*="cookie"] button', 
+        'div[class*="cookie"] button',
+    ]
+    for sel in selectors:
+        try:
+            b = page.locator(sel)
+            if await b.count():
+                await b.first.click(timeout=1000)
+                await page.wait_for_timeout(300)
+        except PWTimeout:
+            pass
+        except Exception:
+            pass
+
+async def deep_scroll(page, max_loops=20, wait_ms=600):
+    last_height = 0
+    same_count = 0
+    for i in range(max_loops):
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(wait_ms)
+        new_height = await page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            same_count += 1
+        else:
+            same_count = 0
+        last_height = new_height
+        if same_count >= 2:
+            break
+
 async def extract_search_links(page, url: str, limit: int) -> List[str]:
     print(f"[search] Búsqueda: {url}")
-    await page.route("**/*", lambda route: route.abort() if route.request.resource_type in {"font","media"} else route.continue_())
-    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    await page.route(
+        "**/*",
+        lambda route: route.abort()
+        if route.request.resource_type in {"font","media"}
+        else route.continue_()
+    )
+    await page.goto(url, wait_until="networkidle", timeout=90000)
+    await dismiss_popups(page)
 
-    # scroll para cargar tarjetas
-    for _ in range(5):
-        await page.mouse.wheel(0, 10000)
-        await page.wait_for_timeout(400)
+    # scroll profundo para cargar todas las cards
+    await deep_scroll(page, max_loops=24, wait_ms=700)
 
+    # 1) intento rápido con selector
     anchors = await page.query_selector_all(SEARCH_A_SELECTOR)
     print(f"[search] anchors /propiedades/ encontrados: {len(anchors)}")
 
-    hrefs, seen = [], set()
+    hrefs = []
+    seen = set()
     for a in anchors:
         href = await a.get_attribute("href")
-        if not href:
-            continue
-        if href.startswith("//"):
-            href = "https:" + href
-        elif href.startswith("/"):
-            href = "https://www.zonaprop.com.ar" + href
-        if "/propiedades/" in href and href not in seen:
-            seen.add(href)
-            hrefs.append(href)
-        if len(hrefs) >= limit:
-            break
+        if href:
+            if href.startswith("//"): href = "https:" + href
+            elif href.startswith("/"): href = "https://www.zonaprop.com.ar" + href
+            if "/propiedades/" in href and href not in seen:
+                seen.add(href); hrefs.append(href)
+
+    # 2) si no encontró nada, barrido de TODOS los <a>
+    if not hrefs:
+        all_hrefs: List[str] = await page.evaluate("""
+            () => Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.getAttribute('href') || '')
+        """)
+        for href in all_hrefs:
+            if not href: 
+                continue
+            if href.startswith("//"): href = "https:" + href
+            elif href.startswith("/"): href = "https://www.zonaprop.com.ar" + href
+            if "/propiedades/" in href and href not in seen:
+                seen.add(href); hrefs.append(href)
 
     print(f"[search] tarjetas detectadas: {len(hrefs)}")
-    return hrefs
+    # limitar
+    return hrefs[:limit]
 
 async def extract_og_meta(page, url: str) -> Dict[str, str]:
     await page.goto(url, wait_until="domcontentloaded", timeout=90000)
@@ -99,10 +148,16 @@ async def extract_og_meta(page, url: str) -> Dict[str, str]:
     desc  = await get("og:description")
     img   = await get("og:image")
     if not title:
-        h1 = await page.locator("h1").first.text_content()
-        title = (h1 or "").strip()
+        try:
+            h1 = await page.locator("h1").first.text_content()
+            title = (h1 or "").strip()
+        except Exception:
+            title = ""
     if not img:
-        img = await page.locator("img").first.get_attribute("src")
+        try:
+            img = await page.locator("img").first.get_attribute("src")
+        except Exception:
+            img = ""
     return {"title": (title or "").strip(), "desc": (desc or "").strip(), "img": (img or "").strip(), "url": url}
 
 # ================== TELEGRAM ==================
@@ -156,8 +211,16 @@ async def run():
     searches = [normalize_search(e) for e in raw_searches]
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-        context = await browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36")
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage","--no-sandbox"]
+        )
+        context = await browser.new_context(
+            locale="es-AR",
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+            viewport={"width":1280,"height":1600}
+        )
         page = await context.new_page()
 
         nuevos_enviados = 0
@@ -199,4 +262,3 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
-
