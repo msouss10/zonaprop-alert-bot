@@ -1,275 +1,347 @@
 #!/usr/bin/env python3
-import asyncio, os, json, re, sys, time
+# -*- coding: utf-8 -*-
+
+"""
+Bot Zonaprop - Envío de nuevos avisos a Telegram
+- Carga búsquedas desde config.yaml
+- Extrae tarjetas, intenta leer fecha (modo blando)
+- Evita duplicados con cache local
+- Envía resumen por Telegram
+
+Requisitos:
+- pip install pyyaml requests playwright
+- playwright install chromium
+- En GitHub Actions: export BOT_TOKEN y CHAT_ID como secrets
+
+Autor: Bot Zonaprop
+"""
+
+import asyncio
+import os
+import json
+import re
+import sys
+import time
 from pathlib import Path
-from datetime import datetime, timezone
-import requests, yaml
+from datetime import datetime, timezone, timedelta
+
+import yaml
+import requests
 from playwright.async_api import async_playwright
 
-# ================== CARGA DE CONFIG ==================
+# ================== CONFIG ==================
 DEF_CFG = {
-    "max_age_hours": 24,           # Aún se usa para fechas ISO reales (JSON-LD/meta); visible-text fuerza "solo hoy"
-    "top_n_per_search": 10,
-    "per_link_delay_sec": 1.0,
-    "searches": [],
+    "max_age_hours": 24,            # ventana de antigüedad objetivo
+    "top_n_per_search": 12,         # máximo de resultados a considerar por búsqueda
+    "per_link_delay_sec": 0.8,      # espera entre visitas a fichas
+    "searches": [],                 # [{label: "...", url: "..."}]
 }
+CFG_PATH = "config.yaml"
+CACHE_PATH = "seen_urls.json"
+
 def load_cfg():
     cfg = DEF_CFG.copy()
-    if Path("config.yaml").exists():
-        with open("config.yaml","r",encoding="utf-8") as f:
+    if Path(CFG_PATH).exists():
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
             file_cfg = yaml.safe_load(f) or {}
-        cfg.update({k:v for k,v in file_cfg.items() if k in DEF_CFG or k=="telegram"})
+        # merge superficial
+        for k, v in file_cfg.items():
+            if k in DEF_CFG:
+                cfg[k] = v
     return cfg
 
 CFG = load_cfg()
 
-# BOT_TOKEN/CHAT_ID: en GitHub se leen de Secrets; localmente podés ponerlos en config.yaml (telegram.*)
-BOT_TOKEN = os.getenv("BOT_TOKEN") or (CFG.get("telegram",{}) or {}).get("bot_token") or ""
-CHAT_ID   = os.getenv("CHAT_ID")   or str((CFG.get("telegram",{}) or {}).get("chat_id") or "")
+# ================== TELEGRAM ==================
+def send_telegram(text, bot_token=None, chat_id=None):
+    bot_token = bot_token or os.getenv("BOT_TOKEN")
+    chat_id   = chat_id   or os.getenv("CHAT_ID")
+    if not bot_token or not chat_id:
+        print("[telegram] FALTA BOT_TOKEN o CHAT_ID")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=25,
+        )
+        ok = r.status_code == 200 and '"ok":true' in r.text
+        print(f"[telegram] status={r.status_code} ok={ok} resp={r.text[:180]}")
+        return ok
+    except Exception as e:
+        print(f"[telegram] EXCEPTION: {e}")
+        return False
 
-MAX_AGE_HOURS       = int(os.getenv("MAX_AGE_HOURS", str(CFG["max_age_hours"])))
-TOP_N_PER_SEARCH    = int(os.getenv("TOP_N_PER_SEARCH", str(CFG["top_n_per_search"])))
-PER_LINK_DELAY_SEC  = float(os.getenv("PER_LINK_DELAY_SEC", str(CFG["per_link_delay_sec"])))
-SEARCHES            = CFG["searches"]
-
-# ================== ESTADO ==================
-DATA_DIR  = Path(".data"); DATA_DIR.mkdir(exist_ok=True, parents=True)
-SEEN_FILE = DATA_DIR / "seen.json"
-
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-        except:
-            return set()
-    return set()
+# ================== CACHE ==================
+def load_seen():
+    if not Path(CACHE_PATH).exists():
+        return set()
+    try:
+        data = json.loads(Path(CACHE_PATH).read_text(encoding="utf-8"))
+        return set(data if isinstance(data, list) else [])
+    except Exception:
+        return set()
 
 def save_seen(seen: set):
-    SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2))
-
-# ================== TELEGRAM ==================
-def send_text(text: str, preview: bool = False):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("[Telegram] Falta BOT_TOKEN o CHAT_ID")
-        return
-    api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": (not preview)}
     try:
-        r = requests.post(api, data=payload, timeout=20)
-        r.raise_for_status()
+        Path(CACHE_PATH).write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
-        print(f"[Telegram] {e}")
+        print(f"[cache] No se pudo guardar cache: {e}")
 
-def send_link(url: str):
-    # Enviar solo el link para que Telegram genere título+descripción+foto
-    send_text(url, preview=True)
+# ================== FILTRO “MODO BLANDO” ==================
+def _is_hoy_o_horas(texto: str) -> bool:
+    t = (texto or "").lower()
+    # coberturas rápidas típicas
+    # ej: "Publicado hoy", "hace 2 horas", "hace 45 min"
+    return any(x in t for x in ["hoy", "min", "minutos", "hora", "horas"])
 
-# ================== EXTRACCIÓN ==================
-# URL de aviso válida
-AD_PATTERN = re.compile(
-    r"^(?:https?://www\.zonaprop\.com\.ar)?/propiedades/(?:clasificado/)?[A-Za-z0-9\-]+-\d+\.html$",
-    re.IGNORECASE,
-)
-
-# Heurísticas SOLO HOY en texto visible
-RE_MIN  = re.compile(r"hace\s+(\d+)\s*min(uto|utos)?", re.I)
-RE_HRS  = re.compile(r"hace\s+(\d+)\s*hora(s)?", re.I)
-RE_HOY  = re.compile(r"\bpublicado\s+hoy\b|\bhoy\b", re.I)  # cubre "Publicado hoy"
-
-def parse_iso_to_utc_hours_ago(iso_str: str) -> float | None:
-    try:
-        s = iso_str.strip()
-        if s.endswith("Z"):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        else:
-            dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
-    except Exception:
+def _parse_hours_from_label(label: str):
+    """
+    Intenta extraer horas aproximadas desde textos tipo 'hace 3 horas', 'hace 25 min'
+    Devuelve float horas o None
+    """
+    if not label:
         return None
-
-def text_hours_today_only(txt: str) -> float | None:
-    """
-    Devuelve horas transcurridas SOLO si es de hoy:
-      - "Publicado hoy" -> 0.0
-      - "hace X minutos" -> X/60
-      - "hace X horas"   -> X
-    Descarta todo lo demás: "ayer", "hace X días", fechas completas, etc.
-    """
-    t = (txt or "").lower()
-    if RE_HOY.search(t):
-        return 0.0
-    m = RE_MIN.search(t)
-    if m: 
-        return int(m.group(1)) / 60.0
-    m = RE_HRS.search(t)
-    if m: 
-        return float(m.group(1))
-    return None  # nada de ayer/días
-
-async def scrape_list(list_page, url: str) -> list[str]:
-    await list_page.goto(url, timeout=120_000, wait_until="domcontentloaded")
-    try:
-        await list_page.wait_for_load_state("networkidle", timeout=60_000)
-    except:
-        pass
-    # scroll para cargar resultados
-    for _ in range(12):
-        await list_page.mouse.wheel(0, 6000)
-        await list_page.wait_for_timeout(800)
-
-    hrefs = await list_page.eval_on_selector_all(
-        "a[href*='/propiedades/']",
-        "els => els.map(e => e.getAttribute('href') || '')",
-    )
-
-    out, dedup = [], set()
-    for raw in hrefs:
-        if not raw: 
-            continue
-        if raw.startswith("https://www.zonaprop.com.ar"):
-            path = raw.replace("https://www.zonaprop.com.ar", "")
-        elif raw.startswith("http://www.zonaprop.com.ar"):
-            path = raw.replace("http://www.zonaprop.com.ar", "")
-        else:
-            path = raw
-        if AD_PATTERN.match(path):
-            link = raw if raw.startswith("http") else "https://www.zonaprop.com.ar" + path
-            pid  = link.split("#")[0]
-            if pid in dedup: 
-                continue
-            dedup.add(pid)
-            out.append(link)
-    return out
-
-async def get_age_hours(detail_page, url: str) -> float | None:
-    """
-    Devuelve cuántas horas pasaron desde la publicación real del aviso.
-    Orden:
-      1) JSON-LD: datePublished / uploadDate / dateModified
-      2) Meta: article:published_time / itemprop=datePublished
-      3) Texto visible SOLO HOY: 'Publicado hoy' / 'hace X horas/minutos'
-         (descarta 'ayer' o 'hace X días' devolviendo None)
-    """
-    try:
-        await detail_page.goto(url, timeout=120_000, wait_until="domcontentloaded")
+    t = label.lower()
+    m = re.search(r"hace\s+(\d+)\s*min", t)
+    if m:
         try:
-            await detail_page.wait_for_load_state("networkidle", timeout=60_000)
+            return max(0.0, float(m.group(1)) / 60.0)
         except:
             pass
+    m = re.search(r"hace\s+(\d+)\s*hora", t)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            pass
+    return None
 
-        # 1) JSON-LD
-        ld_jsons = await detail_page.eval_on_selector_all(
-            "script[type='application/ld+json']",
-            "els => els.map(e => e.textContent || '')"
-        )
-        for raw in ld_jsons:
+def pasa_filtro_fecha(item, max_age_hours=24):
+    """
+    MODO BLANDO:
+    - Si age_hours está calculado -> exige <= max_age_hours
+    - Si NO hay age_hours -> deja pasar si el label sugiere 'hoy/horas/min'
+    - Si tampoco hay pistas -> deja pasar (no descarta por falta de fecha)
+    """
+    age = item.get("age_hours")
+    label = " ".join([
+        str(item.get("age_label") or ""),
+        str(item.get("card_text") or ""),
+        str(item.get("snippet") or "")
+    ]).strip()
+
+    if isinstance(age, (int, float)):
+        return age <= max_age_hours
+
+    # Intento heurístico directo desde el label
+    approx = _parse_hours_from_label(label)
+    if isinstance(approx, (int, float)):
+        return approx <= max_age_hours
+
+    if _is_hoy_o_horas(label):
+        return True
+
+    # Sin señales: no descartamos
+    return True
+
+# ================== PARSERS ==================
+async def extract_cards_from_search(page, top_n=12):
+    """
+    Extrae tarjetas de un listado. Es genérico; busca anchors con href válidos.
+    Adaptado a sitios tipo clasificados (ej. Zonaprop).
+    Devuelve lista de {url, titulo, card_text}
+    """
+    cards = []
+    # Espera a que cargue algo (ajustable)
+    await page.wait_for_timeout(1200)
+    # Tomamos enlaces que parezcan de ficha
+    anchors = await page.query_selector_all("a[href]")
+    seen_urls = set()
+    for a in anchors:
+        href = (await a.get_attribute("href")) or ""
+        if not href:
+            continue
+        # Normalizar absolutos
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            base = page.url.split("/", 3)
+            href = base[0] + "//" + base[2] + href
+
+        # Heurística simple: evitar paginación/anchors y duplicados
+        if any(x in href for x in ["#","javascript:", "whatsapp.com", "facebook.com", "twitter.com"]):
+            continue
+        # Pista de "ficha"; en Zonaprop suelen tener "/propiedades/" o similar
+        if not re.search(r"/propiedad|/propiedades|inmueble|/p/\d", href, re.IGNORECASE):
+            continue
+
+        title = (await a.text_content()) or ""
+        title = re.sub(r"\s+", " ", title).strip()
+        if href not in seen_urls:
+            cards.append({"url": href, "titulo": title, "card_text": title})
+            seen_urls.add(href)
+        if len(cards) >= top_n:
+            break
+    return cards
+
+async def enrich_detail_try(page, url, per_link_delay_sec=0.8):
+    """
+    Visita la ficha y trata de extraer fecha/antigüedad de publicación con varios selectores.
+    Si no encuentra, deja fields en None (modo blando lo maneja).
+    """
+    out = {"url": url, "age_hours": None, "age_label": None, "titulo": None}
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(int(per_link_delay_sec * 1000))
+
+        # título
+        h1 = await page.query_selector("h1") or await page.query_selector("h1,h2,[data-testid='header-title']")
+        if h1:
+            t = (await h1.text_content()) or ""
+            out["titulo"] = re.sub(r"\s+", " ", t).strip()
+
+        # intentos de fecha (varios selectores comunes)
+        sel_candidates = [
+            "meta[itemprop='datePublished']",
+            "time[itemprop='datePublished']",
+            "meta[property='og:updated_time']",
+            "[data-testid*='published']",
+            "span:has-text('Publicado')",
+            "div:has-text('Publicado hoy')",
+            "div:has-text('hace')",
+        ]
+
+        label_texts = []
+
+        for sel in sel_candidates:
+            els = await page.query_selector_all(sel)
+            for el in els:
+                # meta content?
+                tag = (await el.evaluate("(e)=>e.tagName")) or ""
+                tag = tag.lower()
+                content = ""
+                if tag == "meta":
+                    content = (await el.get_attribute("content")) or ""
+                else:
+                    content = (await el.text_content()) or ""
+                content = re.sub(r"\s+", " ", content).strip()
+                if content:
+                    label_texts.append(content)
+
+        label_text = " | ".join(dict.fromkeys(label_texts)) if label_texts else None
+        out["age_label"] = label_text
+
+        # cálculo age_hours si hay un datetime ISO
+        iso = None
+        if label_text:
+            m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[:\d{0,2}]*)", label_text)
+            if m:
+                iso = m.group(1)
+        if iso:
             try:
-                import json as _json
-                data = _json.loads(raw)
-                candidates = data if isinstance(data, list) else [data]
-                for d in candidates:
-                    for key in ("datePublished", "uploadDate", "dateModified"):
-                        v = d.get(key)
-                        if isinstance(v, str):
-                            hrs = parse_iso_to_utc_hours_ago(v)
-                            if hrs is not None:
-                                return hrs
+                dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
+                now = datetime.now(timezone.utc)
+                out["age_hours"] = max(0.0, (now - dt).total_seconds() / 3600.0)
             except Exception:
                 pass
+        else:
+            # Fallback heurístico desde texto “hace X hora/min”
+            approx = _parse_hours_from_label(label_text or "")
+            if isinstance(approx, (int, float)):
+                out["age_hours"] = approx
 
-        # 2) Meta
-        meta_time = await detail_page.eval_on_selector(
-            "meta[property='article:published_time'], meta[itemprop='datePublished']",
-            "el => el ? el.getAttribute('content') : null"
-        )
-        if meta_time:
-            hrs = parse_iso_to_utc_hours_ago(meta_time)
-            if hrs is not None:
-                return hrs
-
-        # 3) Texto visible SOLO HOY
-        whole = await detail_page.eval_on_selector(
-            "body", "el => (el.textContent || '').replace(/\\s+/g,' ').trim()"
-        )
-        hrs = text_hours_today_only(whole or "")
-        return hrs  # None si no es de hoy
     except Exception as e:
-        print(f"[age] {e}")
-        return None
+        print(f"[detail] ERROR al enriquecer {url}: {e}")
+    return out
 
-# ================== RUN ==================
-async def run(force: bool = False, warmup: bool = False):
-    if not SEARCHES:
-        print("No hay 'searches' en config.yaml")
+# ================== PIPELINE PRINCIPAL ==================
+async def run_once():
+    searches = CFG.get("searches") or []
+    if not searches:
+        print("[cfg] No hay búsquedas definidas en config.yaml -> nada para hacer.")
         return
 
     seen = load_seen()
-    total_new_detected = 0
+    print(f"[cache] URLs ya enviadas: {len(seen)}")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    nuevos_totales = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         ))
-        list_page   = await ctx.new_page()
-        detail_page = await ctx.new_page()
+        page = await context.new_page()
 
-        for s in SEARCHES:
-            name, url = s["name"], s["url"]
-            print(f"Buscando {name} ...")
+        for s in searches:
+            label = (s.get("label") or "Búsqueda").strip()
+            url   = s.get("url") or ""
+            if not url:
+                print(f"[search] {label}: sin URL, salto.")
+                continue
+
+            print(f"\n[search] {label}: {url}")
             try:
-                links = await scrape_list(list_page, url)
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
-                print(f"[WARN] {name}: {e}")
+                print(f"[search] No se pudo abrir listado: {e}")
                 continue
 
-            if warmup:
-                nuevos = [u for u in links if u not in seen]
-                seen.update(links)
-                total_new_detected += len(nuevos)
-                print(f"  (warmup) vistos: {len(links)} | nuevos marcados: {len(nuevos)}")
-                continue
+            cards = await extract_cards_from_search(page, top_n=int(CFG.get("top_n_per_search", 12)))
+            print(f"[search] tarjetas detectadas: {len(cards)}")
 
-            # candidatos (si no es force, excluimos ya enviados)
-            candidates = links if force else [u for u in links if u not in seen]
+            # nuevos vs cache
+            candidatos = [c for c in cards if c["url"] not in seen]
+            print(f"[search] candidatos no vistos: {len(candidatos)}")
 
-            # chequeamos hasta cubrir el tope (miramos algunos más por si varios quedan afuera)
-            to_check = candidates[: max(TOP_N_PER_SEARCH * 3, TOP_N_PER_SEARCH + 5)]
-            enviados = 0
-            header_sent = False
+            # enriquecer cada uno (detalle)
+            enriquecidos = []
+            for c in candidatos:
+                d = await enrich_detail_try(page, c["url"], per_link_delay_sec=CFG.get("per_link_delay_sec", 0.8))
+                # merge campos
+                d["card_text"] = c.get("card_text")
+                if not d.get("titulo"):
+                    d["titulo"] = c.get("titulo")
+                enriquecidos.append(d)
 
-            for u in to_check:
-                age = await get_age_hours(detail_page, u)
-                if age is None:
-                    # No es de hoy o no pudimos inferir -> descartar
-                    continue
-                if age <= MAX_AGE_HOURS:
-                    if not header_sent:
-                        send_text(f"{name}:")  # encabezado
-                        header_sent = True
-                    send_link(u)
-                    enviados += 1
-                    seen.add(u)
-                    time.sleep(PER_LINK_DELAY_SEC)
-                    if enviados >= TOP_N_PER_SEARCH:
-                        break
+            # filtro modo blando
+            filtrados = [it for it in enriquecidos if pasa_filtro_fecha(it, CFG.get("max_age_hours", 24))]
+            print(f"[filtro] candidatos={len(enriquecidos)} -> tras modo_blando={len(filtrados)}")
+            sin_fecha = [it for it in enriquecidos if it.get("age_hours") is None]
+            print(f"[fecha] sin fecha detectable (info heurística): {len(sin_fecha)}")
 
-            if not force:
-                # métrica: cuántos candidatos NUEVOS vimos esta vez (antes de filtros)
-                total_new_detected += len([u for u in candidates if u not in seen])
+            # armar mensaje por búsqueda
+            if filtrados:
+                titulo = f"🆕 {label} — publicados recientes"
+                bloques = [titulo]
+                for it in filtrados:
+                    t = (it.get("titulo") or it.get("card_text") or "").strip()
+                    linea = f"- {t} {it['url']}".strip()
+                    bloques.append(linea)
+                    # marcar como visto
+                    seen.add(it["url"])
+                msg = "\n".join(bloques)[:3800]
+                print("[send] Enviando a Telegram…")
+                send_telegram(msg)
+                nuevos_totales.extend(filtrados)
+            else:
+                print("[send] Nada para enviar en esta búsqueda.")
 
+        await context.close()
         await browser.close()
 
     save_seen(seen)
-    if warmup:
-        print("Warm-up listo. Historial guardado en .data/seen.json")
-    else:
-        print(f"Listo. Nuevos detectados (previo a filtro/tope): {total_new_detected}")
+    print(f"\n[resumen] Nuevos totales enviados: {len(nuevos_totales)}")
+
+def main():
+    try:
+        asyncio.run(run_once())
+    except KeyboardInterrupt:
+        print("Cancelado por usuario.")
+    except Exception as e:
+        print(f"[fatal] {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    FORCE  = "--force"  in sys.argv
-    WARMUP = "--warmup" in sys.argv
-    asyncio.run(run(force=FORCE, warmup=WARMUP))
+    main()
