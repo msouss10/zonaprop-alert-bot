@@ -1,302 +1,227 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import os
-import json
-import re
-import sys
-import time
+import asyncio, os, json, time
 from pathlib import Path
-from datetime import datetime, timezone
-
-import yaml
+from typing import List, Dict
 import requests
 from playwright.async_api import async_playwright
 
 # ================== CONFIG ==================
 DEF_CFG = {
-    "max_age_hours": 24,
-    "top_n_per_search": 12,
-    "per_link_delay_sec": 0.8,
-    "sleep_between_msgs_sec": 1.2,   # pausa entre mensajes a Telegram
-    "searches": [],
+    # sin filtros de fecha ni "modo_blando"
+    "top_n_per_search": 20,          # cuántos links por búsqueda (máximo)
+    "per_link_delay_sec": 1.0,       # pausa entre envíos a Telegram
+    "searches": [],                  # lista de URLs de búsqueda de Zonaprop
 }
-CFG_PATH = "config.yaml"
-CACHE_PATH = "seen_urls.json"
-
-def load_cfg():
+def load_cfg() -> Dict:
     cfg = DEF_CFG.copy()
-    if Path(CFG_PATH).exists():
-        with open(CFG_PATH, "r", encoding="utf-8") as f:
-            file_cfg = yaml.safe_load(f) or {}
-        for k, v in file_cfg.items():
-            if k in DEF_CFG:
-                cfg[k] = v
+    # config.yaml (opcional): 
+    # telegram: { bot_token: "...", chat_id: "..." }
+    # top_n_per_search: 20
+    # per_link_delay_sec: 1.0
+    # searches: ["https://www.zonaprop.com.ar/....html", ...]
+    if Path("config.yaml").exists():
+        # sin dependencias externas tipo yaml para simplificar: soporte JSON mínimo
+        # si preferís YAML, reinstalamos pyyaml y lo volvemos a activar
+        try:
+            import yaml  # type: ignore
+            with open("config.yaml","r",encoding="utf-8") as f:
+                file_cfg = yaml.safe_load(f) or {}
+        except Exception:
+            try:
+                # fallback: si el archivo es JSON válido
+                import json as _json
+                file_cfg = _json.loads(Path("config.yaml").read_text(encoding="utf-8"))
+            except Exception:
+                file_cfg = {}
+        if isinstance(file_cfg, dict):
+            for k, v in file_cfg.items():
+                if k in DEF_CFG or k == "telegram":
+                    cfg[k] = v
     return cfg
 
 CFG = load_cfg()
 
-# ================== TELEGRAM ==================
-def send_telegram(text, bot_token=None, chat_id=None, disable_preview=False):
-    bot_token = bot_token or os.getenv("BOT_TOKEN")
-    chat_id   = chat_id   or os.getenv("CHAT_ID")
-    if not bot_token or not chat_id:
-        print("[telegram] FALTA BOT_TOKEN o CHAT_ID")
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": "true" if disable_preview else "false",
-            },
-            timeout=25,
-        )
-        ok = r.status_code == 200 and '"ok":true' in r.text
-        print(f"[telegram] status={r.status_code} ok={ok} resp={r.text[:160]}")
-        return ok
-    except Exception as e:
-        print(f"[telegram] EXCEPTION: {e}")
-        return False
+# BOT_TOKEN/CHAT_ID: primero busca en env; si no, en config.yaml
+BOT_TOKEN = os.getenv("BOT_TOKEN") or (CFG.get("telegram",{}) or {}).get("bot_token") or ""
+CHAT_ID   = os.getenv("CHAT_ID")   or (CFG.get("telegram",{}) or {}).get("chat_id")   or ""
 
-# ================== CACHE ==================
-def load_seen():
-    if not Path(CACHE_PATH).exists():
-        return set()
-    try:
-        data = json.loads(Path(CACHE_PATH).read_text(encoding="utf-8"))
-        return set(data if isinstance(data, list) else [])
-    except Exception:
-        return set()
+CACHE_PATH = Path("cache.json")
 
-def save_seen(seen: set):
-    try:
-        Path(CACHE_PATH).write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"[cache] No se pudo guardar cache: {e}")
+# ================== UTILIDADES ==================
+def load_cache() -> Dict[str, float]:
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
-# ================== FILTRO (modo blando) ==================
-def _is_hoy_o_horas(texto: str) -> bool:
-    t = (texto or "").lower()
-    return any(x in t for x in ["hoy", "min", "minutos", "hora", "horas"])
+def save_cache(cache: Dict[str, float]) -> None:
+    CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def _parse_hours_from_label(label: str):
-    if not label:
-        return None
-    t = label.lower()
-    m = re.search(r"hace\s+(\d+)\s*min", t)
-    if m:
-        return max(0.0, float(m.group(1)) / 60.0)
-    m = re.search(r"hace\s+(\d+)\s*hora", t)
-    if m:
-        return float(m.group(1))
-    return None
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-def pasa_filtro_fecha(item, max_age_hours=24):
-    age = item.get("age_hours")
-    label = " ".join([
-        str(item.get("age_label") or ""),
-        str(item.get("card_text") or ""),
-    ]).strip()
+# ================== SCRAPER ==================
+SEARCH_A_SELECTOR = 'a[href*="/propiedades/"]'
 
-    if isinstance(age, (int, float)):
-        return age <= max_age_hours
+async def extract_search_links(page, url: str, limit: int) -> List[str]:
+    print(f"[search] Búsqueda: {url}")
+    await page.route("**/*", lambda route: route.abort() if route.request.resource_type in {"font","media"} else route.continue_())
+    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    # pequeño scroll para forzar carga de tarjetas
+    for _ in range(5):
+        await page.mouse.wheel(0, 10000)
+        await page.wait_for_timeout(400)
 
-    approx = _parse_hours_from_label(label)
-    if isinstance(approx, (int, float)):
-        return approx <= max_age_hours
+    anchors = await page.query_selector_all(SEARCH_A_SELECTOR)
+    print(f"[search] anchors /propiedades/ encontrados: {len(anchors)}")
 
-    if _is_hoy_o_horas(label):
-        return True
-
-    # sin señales: no descartamos
-    return True
-
-# ================== PARSERS ==================
-async def extract_cards_from_search(page, top_n=12):
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(800)
-
-    anchors = await page.query_selector_all("a[href*='/propiedades/']")
-    if not anchors:
-        anchors = await page.query_selector_all("a[href]")
-
-    seen_urls = set()
-    cards = []
-
+    hrefs = []
+    seen = set()
     for a in anchors:
-        href = (await a.get_attribute("href")) or ""
+        href = await a.get_attribute("href")
         if not href:
             continue
+        # normalizar enlaces absolutos
         if href.startswith("//"):
             href = "https:" + href
         elif href.startswith("/"):
-            base = page.url.split("/", 3)
-            href = base[0] + "//" + base[2] + href
-        if "/propiedades/" not in href:
-            continue
-
-        title = (await a.text_content()) or ""
-        title = re.sub(r"\s+", " ", title).strip()
-
-        if href in seen_urls:
-            continue
-        seen_urls.add(href)
-
-        cards.append({"url": href, "titulo": title or "Aviso", "card_text": title})
-        if len(cards) >= top_n:
+            href = "https://www.zonaprop.com.ar" + href
+        if "/propiedades/" in href and href not in seen:
+            seen.add(href)
+            hrefs.append(href)
+        if len(hrefs) >= limit:
             break
 
-    print(f"[search] anchors /propiedades/ encontrados: {len(cards)}")
-    return cards
+    print(f"[search] tarjetas detectadas: {len(hrefs)}")
+    return hrefs
 
-async def enrich_detail_try(page, url, per_link_delay_sec=0.8):
-    out = {"url": url, "age_hours": None, "age_label": None, "titulo": None}
+async def extract_og_meta(page, url: str) -> Dict[str, str]:
+    # Abrimos la ficha y tomamos og:title / og:description / og:image (más robusto)
+    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    await page.wait_for_timeout(800)
+    get = lambda prop: page.locator(f'meta[property="{prop}"]').get_attribute("content")
+    title = await get("og:title")
+    desc  = await get("og:description")
+    img   = await get("og:image")
+    # fallbacks rápidos
+    if not title:
+        h1 = await page.locator("h1").first.text_content()
+        title = (h1 or "").strip()
+    if not img:
+        img = await page.locator("img").first.get_attribute("src")
+    return {
+        "title": (title or "").strip(),
+        "desc":  (desc or "").strip(),
+        "img":   (img or "").strip(),
+        "url":   url,
+    }
+
+# ================== TELEGRAM ==================
+def tg_send_photo(token: str, chat_id: str, photo_url: str, caption: str) -> bool:
+    if not token or not chat_id:
+        print("[tg] Faltan credenciales BOT_TOKEN/CHAT_ID")
+        return False
+    endpoint = f"https://api.telegram.org/bot{token}/sendPhoto"
+    data = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "caption": caption[:1024],   # límite Telegram
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(int(per_link_delay_sec * 1000))
-
-        h1 = await page.query_selector("h1")
-        if h1:
-            t = (await h1.text_content()) or ""
-            out["titulo"] = re.sub(r"\s+", " ", t).strip()
-
-        sel_candidates = [
-            "meta[itemprop='datePublished']",
-            "time[itemprop='datePublished']",
-            "meta[property='og:updated_time']",
-            "[data-testid*='published']",
-            "span:has-text('Publicado')",
-            "div:has-text('Publicado hoy')",
-            "div:has-text('hace')",
-        ]
-
-        label_texts = []
-        for sel in sel_candidates:
-            els = await page.query_selector_all(sel)
-            for el in els:
-                tag = (await el.evaluate("(e)=>e.tagName")).lower()
-                content = (await el.get_attribute("content")) or (await el.text_content()) or ""
-                content = re.sub(r"\s+", " ", content).strip()
-                if content:
-                    label_texts.append(content)
-
-        label_text = " | ".join(dict.fromkeys(label_texts)) if label_texts else None
-        out["age_label"] = label_text
-
-        iso = None
-        if label_text:
-            m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[:\d{0,2}]*)", label_text)
-            if m:
-                iso = m.group(1)
-        if iso:
-            try:
-                dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
-                now = datetime.now(timezone.utc)
-                out["age_hours"] = max(0.0, (now - dt).total_seconds() / 3600.0)
-            except:
-                pass
-        else:
-            approx = _parse_hours_from_label(label_text or "")
-            if isinstance(approx, (int, float)):
-                out["age_hours"] = approx
-
+        r = requests.post(endpoint, data=data, timeout=30)
+        ok = r.ok and (r.json().get("ok") is True)
+        if not ok:
+            print(f"[tg] sendPhoto fallo: {r.status_code} {r.text[:200]}")
+        return ok
     except Exception as e:
-        print(f"[detail] ERROR {url}: {e}")
-    return out
+        print(f"[tg] Error sendPhoto: {e}")
+        return False
 
-# ================== PIPELINE ==================
-async def run_once():
-    searches = CFG.get("searches") or []
+def tg_send_message(token: str, chat_id: str, text: str) -> bool:
+    endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text[:4096],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    try:
+        r = requests.post(endpoint, data=data, timeout=30)
+        ok = r.ok and (r.json().get("ok") is True)
+        if not ok:
+            print(f"[tg] sendMessage fallo: {r.status_code} {r.text[:200]}")
+        return ok
+    except Exception as e:
+        print(f"[tg] Error sendMessage: {e}")
+        return False
+
+def build_caption(meta: Dict[str, str]) -> str:
+    parts = []
+    if meta.get("title"):
+        parts.append(f"<b>{meta['title']}</b>")
+    if meta.get("desc"):
+        parts.append(meta["desc"])
+    parts.append(meta["url"])
+    return "\n".join(parts).strip()
+
+# ================== MAIN ==================
+async def run():
+    cfg = CFG
+    cache = load_cache()
+    print(f"[cache] URLs ya enviadas: {len(cache)}")
+
+    searches: List[str] = cfg.get("searches", []) or []
     if not searches:
-        print("[cfg] No hay búsquedas definidas.")
+        print("[cfg] No hay URLs en 'searches'. Agregá búsquedas en config.yaml")
         return
 
-    seen = load_seen()
-    print(f"[cache] URLs ya enviadas: {len(seen)}")
-
-    sleep_between = float(CFG.get("sleep_between_msgs_sec", 1.2))
-    nuevos_totales = []
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+        )
         page = await context.new_page()
 
-        for s in searches:
-            label = (s.get("label") or "Búsqueda").strip()
-            url   = s.get("url") or ""
-            if not url:
-                continue
+        nuevos_enviados = 0
 
-            print(f"\n[search] {label}: {url}")
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=45000)
-
-                # aceptar cookies
-                for sel in [
-                    "button:has-text('Aceptar')",
-                    "button:has-text('Aceptar y cerrar')",
-                    "button:has-text('Acepto')",
-                    "[aria-label*='Aceptar']",
-                ]:
-                    try:
-                        btn = await page.query_selector(sel)
-                        if btn:
-                            await btn.click()
-                            await page.wait_for_timeout(500)
-                            break
-                    except:
-                        pass
-
-            except Exception as e:
-                print(f"[search] No se pudo abrir listado: {e}")
-                continue
-
-            cards = await extract_cards_from_search(page, top_n=int(CFG.get("top_n_per_search", 12)))
-            print(f"[search] tarjetas detectadas: {len(cards)}")
-
-            candidatos = [c for c in cards if c["url"] not in seen]
+        for url in searches:
+            links = await extract_search_links(page, url, cfg.get("top_n_per_search", 20))
+            candidatos = [u for u in links if u not in cache]
             print(f"[search] candidatos no vistos: {len(candidatos)}")
 
-            enriquecidos = []
-            for c in candidatos:
-                d = await enrich_detail_try(page, c["url"], per_link_delay_sec=CFG.get("per_link_delay_sec", 0.8))
-                d["card_text"] = c.get("card_text")
-                if not d.get("titulo"):
-                    d["titulo"] = c.get("titulo")
-                enriquecidos.append(d)
+            for link in candidatos:
+                try:
+                    meta = await extract_og_meta(page, link)
+                    caption = build_caption(meta)
 
-            filtrados = [it for it in enriquecidos if pasa_filtro_fecha(it, CFG.get("max_age_hours", 24))]
-            print(f"[filtro] candidatos={len(enriquecidos)} -> tras modo_blando={len(filtrados)}")
-            print(f"[fecha] sin fecha detectable: {len([it for it in enriquecidos if it.get('age_hours') is None])}")
+                    ok = False
+                    if meta.get("img"):
+                        ok = tg_send_photo(BOT_TOKEN, CHAT_ID, meta["img"], caption)
+                    if not ok:
+                        ok = tg_send_message(BOT_TOKEN, CHAT_ID, caption)
 
-            # Enviar UNO POR UNO para que Telegram muestre la foto de preview
-            for it in filtrados:
-                titulo = (it.get("titulo") or it.get("card_text") or "").strip()
-                msg = f"🆕 {label}\n{titulo}\n{it['url']}".strip()
-                print("[send] Enviando item…")
-                ok = send_telegram(msg, disable_preview=False)
-                if ok:
-                    seen.add(it["url"])
-                    nuevos_totales.append(it)
-                time.sleep(sleep_between)
+                    if ok:
+                        cache[link] = time.time()
+                        nuevos_enviados += 1
+                        print(f"[send] enviado ✅  {link}")
+                    else:
+                        print(f"[send] fallo    ❌  {link}")
 
-        await context.close()
+                    await page.wait_for_timeout(int(cfg.get("per_link_delay_sec", 1.0) * 1000))
+                except Exception as e:
+                    print(f"[err] {link}: {e}")
+
         await browser.close()
 
-    save_seen(seen)
-    print(f"\n[resumen] Nuevos totales enviados: {len(nuevos_totales)}")
-
-def main():
-    try:
-        asyncio.run(run_once())
-    except KeyboardInterrupt:
-        print("Cancelado por usuario.")
-    except Exception as e:
-        print(f"[fatal] {e}")
-        sys.exit(1)
+    save_cache(cache)
+    print(f"[fin] Nuevos enviados: {nuevos_enviados}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
